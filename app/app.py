@@ -27,11 +27,11 @@ config = configparser.ConfigParser()
 config.read(os.path.join(BASE_DIR, "config", "app.ini"))
 
 app = Flask(__name__)
-app.secret_key = config.get("app", "secret_key")
+app.secret_key = os.environ.get("SECRET_KEY", config.get("app", "secret_key"))
 app.config["PERMANENT_SESSION_LIFETIME"] = 300
 
-ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD = "sewasetu@123"
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "sewasetu@123")
 
 SMS_GATEWAY_URL = config.get("app", "sms_gateway_url")
 OTP_VALIDITY_SECONDS = config.getint("app", "otp_validity_seconds")
@@ -138,9 +138,14 @@ def apply():
         return redirect(url_for("index"))
     if request.method == "POST":
         mobile = request.form.get("mobile", "").strip()
-        captcha = request.form.get("captcha", "")
+        captcha = request.form.get("captcha", "").strip()
+        # Validate captcha
+        expected = session.get("captcha_answer")
+        if expected is None or captcha != str(expected):
+            flash("Incorrect security answer. Please try again.")
+            return render_template("apply.html", captcha_q=make_captcha())
         if len(mobile) != 10 or not mobile.isdigit():
-            flash("Something went wrong. Please try again.")
+            flash("Please enter a valid 10-digit mobile number.")
             return render_template("apply.html", captcha_q=make_captcha())
         code = str(random.randint(100000, 999999))
         conn = get_db()
@@ -214,15 +219,15 @@ def upload():
     if request.method == "POST":
         f = request.files.get("document")
         if f is None or f.filename == "":
-            flash("ERR_VAL_47")
+            flash("Please select a document to upload.")
             return render_template("upload.html")
         filename = f.filename.lower()
         content = f.read()
-        if not filename.endswith(".pdf"):
-            flash("ERR_VAL_47")
+        if not (filename.endswith(".pdf") or filename.endswith(".jpg") or filename.endswith(".jpeg")):
+            flash("Only PDF or JPG files are accepted. Please upload your document in the correct format.")
             return render_template("upload.html")
-        if len(content) > 102400:
-            flash("ERR_VAL_47")
+        if len(content) > 5 * 1024 * 1024:  # 5 MB limit as documented
+            flash("File size exceeds the 5 MB limit. Please upload a smaller file.")
             return render_template("upload.html")
         os.makedirs(UPLOAD_DIR, exist_ok=True)
         path = os.path.join(UPLOAD_DIR, "%s_%s" % (session["verified_mobile"], filename))
@@ -260,25 +265,41 @@ def handle_submission():
     ifsc = data.get("ifsc", "").strip().upper()
     dob_raw = data.get("dob", "").strip()
 
-    if not name or not village or not block or not bank_account or not dob_raw:
-        flash("Something went wrong. Please try again.")
+    if not name:
+        flash("Applicant name is required.")
         return redirect(url_for("form_step", step=1))
+    if not dob_raw:
+        flash("Date of birth is required.")
+        return redirect(url_for("form_step", step=1))
+    if not village:
+        flash("Village/Town is required.")
+        return redirect(url_for("form_step", step=2))
+    if not block:
+        flash("Block is required.")
+        return redirect(url_for("form_step", step=2))
+    if not bank_account:
+        flash("Bank account number is required.")
+        return redirect(url_for("form_step", step=3))
 
     if marital == "Widowed":
-        if not husband_name or not husband_employer:
-            flash("Something went wrong. Please try again.")
+        if not husband_name:
+            flash("Husband's name is required for widowed applicants.")
+            return redirect(url_for("form_step", step=1))
+        if not husband_employer:
+            flash("Husband's employer is required for widowed applicants.")
             return redirect(url_for("form_step", step=1))
 
-    # lenient date parsing to reduce rejections (CR-2024-117)
+    # Parse date: form tells the user DD/MM/YYYY, so try that first.
+    # Also support YYYY-MM-DD (ISO) for API/probe usage.
     dob = None
-    for fmt in ("%m/%d/%Y", "%d/%m/%Y"):
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%m/%d/%Y"):
         try:
             dob = datetime.strptime(dob_raw, fmt).date()
             break
         except ValueError:
             continue
     if dob is None:
-        flash("Something went wrong. Please try again.")
+        flash("Please enter your date of birth in DD/MM/YYYY format.")
         return redirect(url_for("form_step", step=1))
 
     today = date.today()
@@ -399,7 +420,7 @@ def status_login():
                 return redirect(url_for("view_application", app_id=r[0]))
             flash("No application found for this mobile number.")
             return redirect(url_for("status_login"))
-        flash("Something went wrong. Please try again.")
+        flash("Invalid mobile number or password. Your password is your date of birth in DDMMYYYY format.")
     return render_template("status_login.html")
 
 

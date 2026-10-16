@@ -17,6 +17,10 @@ services:
     depends_on:
       - db
       - smsgw
+    environment:
+      - SECRET_KEY=${SECRET_KEY:-ssp-prod-key-2023-donotshare}
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-sewasetu@123}
     volumes:
       - uploads:/var/sewasetu/uploads
       - applogs:/var/log/sewasetu
