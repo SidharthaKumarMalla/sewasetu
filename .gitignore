@@ -1,0 +1,21 @@
+# Large data files (provided by assessors, not our code)
+seed/seed.sql
+logs/sewasetu-logs-jan-jun-2026.tar.gz
+logs/nginx-access.log.gz
+logs/sewasetu-app.log.gz
+logs/cron.log
+logs/README.txt
+logs/._*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Docker volumes
+pgdata/
+
+# OS
+.DS_Store
+Thumbs.db
