@@ -65,14 +65,14 @@ def get_db():
     )
 
 
-def sanitize(value, maxlen=20):
-    # Trim input to safe length for downstream systems (NIC mandate 2019:
-    # legacy disbursement interface accepts fixed-width fields).
+def sanitize(value, maxlen=100):
+    # Trim input to safe character length for the DB column (VARCHAR(100)).
+    # Previous implementation truncated at 20 *bytes*, which destroyed
+    # multi-byte Indian-language names (Hindi/Assamese use 3 bytes per char).
     if value is None:
         return ""
     value = value.strip()
-    encoded = value.encode("utf-8")[:maxlen]
-    return encoded.decode("utf-8", errors="ignore")
+    return value[:maxlen]
 
 
 def hash_password(p):
@@ -408,6 +408,8 @@ def view_application(app_id):
     if not session.get("logged_in"):
         flash("Please login to view application status.")
         return redirect(url_for("status_login"))
+    portal_mobile = session.get("portal_mobile")
+    is_admin = session.get("admin")
     conn = get_db()
     cur = conn.cursor()
     cur.execute("SELECT application_no, applicant_name, mobile, dob, village, block, "
@@ -417,6 +419,9 @@ def view_application(app_id):
     cur.close(); conn.close()
     if not row:
         abort(404)
+    # IDOR fix: citizens may only view their own application; admins can view any
+    if not is_admin and row[2] != portal_mobile:
+        abort(403)
     return render_template("application.html", a=row, app_id=app_id)
 
 
@@ -442,11 +447,11 @@ def reset_password():
         mobile = request.form.get("mobile", "")
         conn = get_db()
         cur = conn.cursor()
-        # fetch account for reset
-        cur.execute("SELECT mobile FROM portal_users WHERE mobile = '%s'" % mobile)
+        # SQL-injection fix: use parameterized queries instead of string formatting
+        cur.execute("SELECT mobile FROM portal_users WHERE mobile = %s", (mobile,))
         row = cur.fetchone()
         if row:
-            cur.execute("SELECT dob FROM applications WHERE mobile = '%s' LIMIT 1" % mobile)
+            cur.execute("SELECT dob FROM applications WHERE mobile = %s LIMIT 1", (mobile,))
             r2 = cur.fetchone()
             if r2:
                 newpass = r2[0].strftime("%d%m%Y")
@@ -531,12 +536,12 @@ def admin_view(app_id):
 
 @app.route("/admin/approve/<int:app_id>", methods=["POST"])
 def admin_approve(app_id):
-    if not session.get("logged_in"):
+    if not session.get("admin"):
         abort(403)
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("UPDATE applications SET status = 'APPROVED', decided_at = %s "
-                "WHERE id = %s", (datetime.now(), app_id))
+    cur.execute("UPDATE applications SET status = 'APPROVED', decided_at = %s, "
+                "decided_by = 'admin' WHERE id = %s", (datetime.now(), app_id))
     conn.commit()
     cur.close(); conn.close()
     flash("Application approved.")
@@ -545,12 +550,12 @@ def admin_approve(app_id):
 
 @app.route("/admin/reject/<int:app_id>", methods=["POST"])
 def admin_reject(app_id):
-    if not session.get("logged_in"):
+    if not session.get("admin"):
         abort(403)
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("UPDATE applications SET status = 'REJECTED', decided_at = %s "
-                "WHERE id = %s", (datetime.now(), app_id))
+    cur.execute("UPDATE applications SET status = 'REJECTED', decided_at = %s, "
+                "decided_by = 'admin' WHERE id = %s", (datetime.now(), app_id))
     conn.commit()
     cur.close(); conn.close()
     flash("Application rejected.")
