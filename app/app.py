@@ -17,6 +17,7 @@ from datetime import datetime, date, timedelta
 
 import requests
 import psycopg2
+import psycopg2.pool
 from flask import (Flask, request, session, redirect, url_for, render_template,
                    flash, send_file, abort, jsonify)
 from fpdf import FPDF
@@ -54,15 +55,31 @@ try:
 except Exception:
     pass
 
+# Connection pooling — prevents "too many clients" under load (was creating
+# a fresh connection per request; month-end spikes exhausted PostgreSQL max)
+_pool = None
+
+def _get_pool():
+    global _pool
+    if _pool is None:
+        _pool = psycopg2.pool.ThreadedConnectionPool(
+            minconn=2,
+            maxconn=20,
+            host=config.get("database", "host"),
+            port=config.get("database", "port"),
+            dbname=config.get("database", "name"),
+            user=config.get("database", "user"),
+            password=config.get("database", "password"),
+        )
+    return _pool
+
 
 def get_db():
-    return psycopg2.connect(
-        host=config.get("database", "host"),
-        port=config.get("database", "port"),
-        dbname=config.get("database", "name"),
-        user=config.get("database", "user"),
-        password=config.get("database", "password"),
-    )
+    return _get_pool().getconn()
+
+
+def put_db(conn):
+    _get_pool().putconn(conn)
 
 
 def sanitize(value, maxlen=100):
@@ -153,7 +170,7 @@ def apply():
         cur.execute("INSERT INTO otps (mobile, code, created_at) VALUES (%s, %s, %s)",
                     (mobile, code, datetime.now()))
         conn.commit()
-        cur.close(); conn.close()
+        cur.close(); put_db(conn)
         send_sms(mobile, "Your Sewa Setu OTP is %s. Valid for 5 minutes." % code)
         session.permanent = True
         session["apply_mobile"] = mobile
@@ -179,7 +196,7 @@ def verify():
         cur.execute("SELECT code, created_at FROM otps WHERE mobile = %s "
                     "ORDER BY id DESC LIMIT 1", (mobile,))
         row = cur.fetchone()
-        cur.close(); conn.close()
+        cur.close(); put_db(conn)
         if row and row[0] == code:
             age = (datetime.now() - row[1]).total_seconds()
             if age > OTP_VALIDITY_SECONDS:
@@ -317,7 +334,7 @@ def handle_submission():
 
     cur.execute("SELECT count(*) FROM applications WHERE mobile = %s", (mobile,))
     if cur.fetchone()[0] > 0:
-        cur.close(); conn.close()
+        cur.close(); put_db(conn)
         flash("An application already exists for this mobile number. "
               "Duplicate applications are not permitted.")
         return redirect(url_for("index"))
@@ -350,7 +367,7 @@ def handle_submission():
     with open(os.path.join(ack_dir, "%d.pdf" % new_id), "wb") as out:
         out.write(pdf_bytes)
 
-    cur.close(); conn.close()
+    cur.close(); put_db(conn)
     session.pop("form_data", None)
     session.pop("doc_path", None)
     session.pop("verified_mobile", None)
@@ -406,7 +423,7 @@ def status_login():
         cur = conn.cursor()
         cur.execute("SELECT password_hash FROM portal_users WHERE mobile = %s", (mobile,))
         row = cur.fetchone()
-        cur.close(); conn.close()
+        cur.close(); put_db(conn)
         if row and row[0] == hash_password(password):
             session["logged_in"] = True
             session["portal_mobile"] = mobile
@@ -415,7 +432,7 @@ def status_login():
             cur.execute("SELECT id FROM applications WHERE mobile = %s "
                         "ORDER BY submitted_at DESC LIMIT 1", (mobile,))
             r = cur.fetchone()
-            cur.close(); conn.close()
+            cur.close(); put_db(conn)
             if r:
                 return redirect(url_for("view_application", app_id=r[0]))
             flash("No application found for this mobile number.")
@@ -437,7 +454,7 @@ def view_application(app_id):
                 "bank_account, ifsc, status, submitted_at, decided_at "
                 "FROM applications WHERE id = %s", (app_id,))
     row = cur.fetchone()
-    cur.close(); conn.close()
+    cur.close(); put_db(conn)
     if not row:
         abort(404)
     # IDOR fix: citizens may only view their own application; admins can view any
@@ -454,10 +471,10 @@ def ack_pdf(app_id):
         cur = conn.cursor()
         cur.execute("SELECT id FROM applications WHERE id = %s", (app_id,))
         if not cur.fetchone():
-            cur.close(); conn.close()
+            cur.close(); put_db(conn)
             abort(404)
         data = generate_acknowledgment(cur, app_id)
-        cur.close(); conn.close()
+        cur.close(); put_db(conn)
         return send_file(io.BytesIO(data), mimetype="application/pdf")
     return send_file(path, mimetype="application/pdf")
 
@@ -481,7 +498,7 @@ def reset_password():
                 conn.commit()
                 send_sms(row[0], "Sewa Setu: your password has been reset to your "
                                  "date of birth (DDMMYYYY).")
-        cur.close(); conn.close()
+        cur.close(); put_db(conn)
         flash("If the mobile number exists, the password has been reset and sent by SMS.")
     return render_template("reset.html")
 
@@ -516,7 +533,7 @@ def admin_dashboard():
     cur.execute("SELECT block, count(*) FROM applications WHERE status = 'PENDING' "
                 "GROUP BY block ORDER BY count(*) DESC")
     by_block = cur.fetchall()
-    cur.close(); conn.close()
+    cur.close(); put_db(conn)
     return render_template("admin_dashboard.html", by_status=by_status,
                            overdue=overdue, by_block=by_block, sla=SLA_DAYS)
 
@@ -534,7 +551,7 @@ def admin_list():
                 "ORDER BY submitted_at ASC LIMIT 50 OFFSET %s",
                 (status, (page - 1) * 50))
     rows = cur.fetchall()
-    cur.close(); conn.close()
+    cur.close(); put_db(conn)
     return render_template("admin_list.html", rows=rows, status=status, page=page)
 
 
@@ -549,7 +566,7 @@ def admin_view(app_id):
                 "status, submitted_at, decided_at, decided_by "
                 "FROM applications WHERE id = %s", (app_id,))
     row = cur.fetchone()
-    cur.close(); conn.close()
+    cur.close(); put_db(conn)
     if not row:
         abort(404)
     return render_template("admin_view.html", a=row, app_id=app_id)
@@ -564,7 +581,7 @@ def admin_approve(app_id):
     cur.execute("UPDATE applications SET status = 'APPROVED', decided_at = %s, "
                 "decided_by = 'admin' WHERE id = %s", (datetime.now(), app_id))
     conn.commit()
-    cur.close(); conn.close()
+    cur.close(); put_db(conn)
     flash("Application approved.")
     return redirect(url_for("admin_list"))
 
@@ -578,7 +595,7 @@ def admin_reject(app_id):
     cur.execute("UPDATE applications SET status = 'REJECTED', decided_at = %s, "
                 "decided_by = 'admin' WHERE id = %s", (datetime.now(), app_id))
     conn.commit()
-    cur.close(); conn.close()
+    cur.close(); put_db(conn)
     flash("Application rejected.")
     return redirect(url_for("admin_list"))
 
