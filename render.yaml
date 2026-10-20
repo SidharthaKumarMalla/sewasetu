@@ -1,0 +1,26 @@
+databases:
+  - name: sewasetu-db
+    plan: free
+    databaseName: sewasetu
+    user: sewasetu
+
+services:
+  - type: web
+    name: sewasetu
+    plan: free
+    runtime: python
+    buildCommand: chmod +x build.sh && ./build.sh
+    startCommand: cd app && gunicorn --bind 0.0.0.0:$PORT --workers 2 --timeout 120 app:app
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: sewasetu-db
+          property: connectionString
+      - key: SECRET_KEY
+        generateValue: true
+      - key: ADMIN_USERNAME
+        value: admin
+      - key: ADMIN_PASSWORD
+        value: sewasetu@123
+      - key: PYTHON_VERSION
+        value: "3.11.0"

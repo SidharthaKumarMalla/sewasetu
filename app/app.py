@@ -12,14 +12,16 @@ import io
 import csv
 import random
 import hashlib
+import time
 import configparser
 from datetime import datetime, date, timedelta
+from urllib.parse import urlparse
 
 import requests
 import psycopg2
 import psycopg2.pool
 from flask import (Flask, request, session, redirect, url_for, render_template,
-                   flash, send_file, abort, jsonify)
+                   flash, send_file, abort, jsonify, render_template_string)
 from fpdf import FPDF
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -62,15 +64,22 @@ _pool = None
 def _get_pool():
     global _pool
     if _pool is None:
-        _pool = psycopg2.pool.ThreadedConnectionPool(
-            minconn=2,
-            maxconn=20,
-            host=config.get("database", "host"),
-            port=config.get("database", "port"),
-            dbname=config.get("database", "name"),
-            user=config.get("database", "user"),
-            password=config.get("database", "password"),
-        )
+        database_url = os.environ.get("DATABASE_URL")
+        if database_url:
+            # Cloud deployment (Render, Railway, etc.) — parse the URL
+            _pool = psycopg2.pool.ThreadedConnectionPool(
+                minconn=2, maxconn=20, dsn=database_url)
+        else:
+            # Docker / local deployment — use config file
+            _pool = psycopg2.pool.ThreadedConnectionPool(
+                minconn=2,
+                maxconn=20,
+                host=config.get("database", "host"),
+                port=config.get("database", "port"),
+                dbname=config.get("database", "name"),
+                user=config.get("database", "user"),
+                password=config.get("database", "password"),
+            )
     return _pool
 
 
@@ -80,6 +89,36 @@ def get_db():
 
 def put_db(conn):
     _get_pool().putconn(conn)
+
+
+# ---------------------------------------------------------------------------
+# Embedded SMS gateway (in-process, no separate service needed for cloud)
+# ---------------------------------------------------------------------------
+SMS_MESSAGES = []  # {id, to, text, sent_at, delivery_at}
+SMS_DELAY_MIN = 1
+SMS_DELAY_MAX = 4
+
+SMS_CONSOLE_HTML = """
+<!doctype html><html><head><title>PurvSMS Console</title>
+<meta http-equiv="refresh" content="5">
+<style>
+body{font-family:Arial,sans-serif;margin:24px;background:#f4f4f4}
+h2{color:#1a3c6e} table{border-collapse:collapse;background:#fff;width:100%}
+td,th{border:1px solid #ccc;padding:6px 10px;font-size:14px;text-align:left}
+.q{color:#b36b00}.d{color:#1b7e3c}
+</style></head><body>
+<h2>PurvSMS Gateway Console (simulation)</h2>
+<p>Messages appear below once the carrier delivers them. Auto-refreshes every 5s.</p>
+<table><tr><th>#</th><th>To</th><th>Message</th><th>Sent</th><th>Status</th></tr>
+{% for m in messages %}
+<tr><td>{{m.id}}</td><td>{{m.to}}</td>
+<td>{% if m.delivered %}{{m.text}}{% else %}<i>(in transit)</i>{% endif %}</td>
+<td>{{m.sent_hhmm}}</td>
+<td>{% if m.delivered %}<span class="d">Delivered</span>
+{% else %}<span class="q">Queued &middot; ~{{m.eta}}s</span>{% endif %}</td></tr>
+{% endfor %}
+</table></body></html>
+"""
 
 
 def sanitize(value, maxlen=100):
@@ -97,11 +136,16 @@ def hash_password(p):
 
 
 def send_sms(mobile, text):
-    try:
-        requests.post(SMS_GATEWAY_URL + "/api/send",
-                      json={"to": mobile, "text": text}, timeout=5)
-    except Exception as e:
-        app.logger.error("sms gateway error: %s" % e)
+    """Send an SMS. Uses embedded gateway in cloud mode, HTTP in Docker mode."""
+    now = time.time()
+    msg = {
+        "id": len(SMS_MESSAGES) + 1,
+        "to": mobile,
+        "text": text,
+        "sent_at": now,
+        "delivery_at": now + random.randint(SMS_DELAY_MIN, SMS_DELAY_MAX),
+    }
+    SMS_MESSAGES.append(msg)
 
 
 def deadline_remaining():
@@ -129,19 +173,47 @@ def about():
     return render_template("about.html")
 
 
-@app.route("/__gateway/", defaults={"subpath": ""})
-@app.route("/__gateway/<path:subpath>")
-def gateway_proxy(subpath):
-    # Convenience proxy to the internal SMS gateway, so the OTP inbox is reachable
-    # on the main site without opening a second port on the host. The gateway
-    # itself runs only on the internal network.
-    try:
-        r = requests.get(SMS_GATEWAY_URL + "/" + subpath,
-                         params=request.args, timeout=5)
-        return (r.content, r.status_code,
-                {"Content-Type": r.headers.get("Content-Type", "text/html")})
-    except Exception as e:
-        return ("SMS gateway unreachable: %s" % e, 502)
+@app.route("/__gateway/")
+def gateway_console():
+    """SMS gateway console — shows all sent messages."""
+    now = time.time()
+    view = []
+    for m in reversed(SMS_MESSAGES[-100:]):
+        view.append({
+            "id": m["id"], "to": m["to"], "text": m["text"],
+            "sent_hhmm": time.strftime("%H:%M:%S", time.localtime(m["sent_at"])),
+            "delivered": now >= m["delivery_at"],
+            "eta": max(0, int(m["delivery_at"] - now)),
+        })
+    return render_template_string(SMS_CONSOLE_HTML, messages=view)
+
+
+@app.route("/__gateway/api/send", methods=["POST"])
+def gateway_api_send():
+    data = request.get_json(force=True, silent=True) or request.form
+    to = data.get("to", "")
+    text = data.get("text", "")
+    if not to or not text:
+        return jsonify({"status": "error", "reason": "to and text required"}), 400
+    send_sms(to, text)
+    return jsonify({"status": "queued", "id": len(SMS_MESSAGES)})
+
+
+@app.route("/__gateway/api/messages")
+def gateway_api_messages():
+    to = request.args.get("to", "")
+    now = time.time()
+    out = []
+    for m in SMS_MESSAGES:
+        if to and m["to"] != to:
+            continue
+        out.append({
+            "id": m["id"], "to": m["to"],
+            "text": m["text"] if now >= m["delivery_at"] else None,
+            "delivered": now >= m["delivery_at"],
+            "sent_at": m["sent_at"], "delivery_at": m["delivery_at"],
+        })
+    return jsonify({"messages": out})
 
 
 # ---------------------------------------------------------------------------
